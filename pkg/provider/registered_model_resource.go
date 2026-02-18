@@ -373,6 +373,7 @@ func (r *RegisteredModelResource) Update(ctx context.Context, req resource.Updat
 			return
 		}
 		plan.VersionID = types.StringValue(registeredModelVersion.ID)
+		plan.VersionName = types.StringValue(registeredModelVersion.Name)
 	}
 
 	// check if we created a new version
@@ -441,6 +442,10 @@ func (r *RegisteredModelResource) findCustomModel(ctx context.Context, customMod
 
 		var customModelVersions []client.CustomModelVersion
 		if customModelVersions, err = r.provider.service.ListCustomModelVersions(ctx, customModel.ID); err != nil {
+			// If the custom model was deleted between listing and fetching versions, continue searching
+			if _, ok := err.(*client.NotFoundError); ok {
+				continue
+			}
 			return
 		}
 
