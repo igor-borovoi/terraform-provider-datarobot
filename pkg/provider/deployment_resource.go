@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -849,14 +850,82 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 		return
 	}
 
+	deploymentID := data.ID.ValueString()
+	tflog.Info(ctx, "Starting Deployment deletion", map[string]interface{}{
+		"deployment_id": deploymentID,
+	})
+
 	traceAPICall("DeleteDeployment")
-	err := r.provider.service.DeleteDeployment(ctx, data.ID.ValueString())
+	err := r.provider.service.DeleteDeployment(ctx, deploymentID)
 	if err != nil {
 		if !errors.Is(err, &client.NotFoundError{}) {
+			tflog.Error(ctx, "Deployment deletion failed", map[string]interface{}{
+				"deployment_id": deploymentID,
+				"error":         err.Error(),
+			})
 			resp.Diagnostics.AddError("Error deleting Deployment", err.Error())
 			return
 		}
 	}
+	tflog.Info(ctx, "Deployment deletion completed successfully", map[string]interface{}{
+		"deployment_id": deploymentID,
+	})
+
+	// Check if there are any pending custom model deletions in provider state
+	// This handles Terraform's non-deterministic deletion order bug (#37975, #30439)
+	// See custom_model_resource.go for where this is set when it receives a 409
+	r.provider.pendingCustomModelDeletions.Range(func(key, value interface{}) bool {
+		customModelID, ok := key.(string)
+		if !ok {
+			tflog.Error(ctx, "Deferred custom model deletion failed: key is not a string", map[string]interface{}{
+				"key": key,
+			})
+			resp.Diagnostics.AddError("Error deleting deferred Custom Model", "Key in pendingCustomModelDeletions is not a string")
+			return true // Continue iteration
+		}
+		tflog.Debug(ctx, "Found pending custom model deletion, completing it now", map[string]interface{}{
+			"custom_model_id": customModelID,
+		})
+
+		// Retry with exponential backoff since deployment deletion might not be fully processed
+		expBackoff := getExponentialBackoff()
+		deleteOperation := func() error {
+			traceAPICall("DeleteCustomModel")
+			err := r.provider.service.DeleteCustomModel(ctx, customModelID)
+			if err != nil {
+				if errors.Is(err, &client.NotFoundError{}) {
+					return nil // Already deleted - success
+				}
+				// Retry on 409 conflicts as the deployment might still be processing
+				if strings.Contains(err.Error(), "409 Conflict") || strings.Contains(err.Error(), "existing deployments") {
+					tflog.Debug(ctx, "Custom model still has deployment references, retrying", map[string]interface{}{
+						"custom_model_id": customModelID,
+					})
+					return err // Transient error, retry
+				}
+				return backoff.Permanent(err) // Other errors are fatal
+			}
+			return nil
+		}
+
+		err := backoff.Retry(deleteOperation, expBackoff)
+		if err != nil {
+			tflog.Error(ctx, "Deferred custom model deletion failed after retries", map[string]interface{}{
+				"custom_model_id": customModelID,
+				"error":           err.Error(),
+			})
+			resp.Diagnostics.AddError("Error deleting deferred Custom Model", err.Error())
+			return false // Stop iteration on error
+		}
+
+		tflog.Debug(ctx, "Deferred custom model deletion completed successfully", map[string]interface{}{
+			"custom_model_id": customModelID,
+		})
+
+		// Remove from pending deletions
+		r.provider.pendingCustomModelDeletions.Delete(customModelID)
+		return true // Continue iteration
+	})
 }
 
 func (r *DeploymentResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {

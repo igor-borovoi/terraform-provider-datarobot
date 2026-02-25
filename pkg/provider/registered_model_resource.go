@@ -405,8 +405,9 @@ func (r *RegisteredModelResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
+	registeredModelID := data.ID.ValueString()
 	traceAPICall("DeleteRegisteredModel")
-	err := r.provider.service.DeleteRegisteredModel(ctx, data.ID.ValueString())
+	err := r.provider.service.DeleteRegisteredModel(ctx, registeredModelID)
 	if err != nil {
 		if !errors.Is(err, &client.NotFoundError{}) {
 			resp.Diagnostics.AddError("Error deleting Registered Model", err.Error())
